@@ -1,0 +1,13 @@
+# YOLOv11 dataset configuration — SDO/HMI Solar Active Regions
+path: ../datasets
+
+train: train/images
+val:   val/images
+test:  test/images
+
+nc: 4
+names:
+  0: Alpha
+  1: Beta
+  2: BetaGamma
+  3: BetaGammaDelta

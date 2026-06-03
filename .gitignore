@@ -1,0 +1,29 @@
+# uv / Python environment
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# uv lock is committed; venv is not
+# uv.lock  <- intentionally NOT ignored
+
+# Data (large binary / scientific files — track with DVC or similar)
+data/raw/
+data/images/
+data/labels/
+datasets/
+
+# Model training outputs
+runs/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
