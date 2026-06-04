@@ -51,12 +51,16 @@ Usage:
 """
 
 import argparse
+import os
 from pathlib import Path
 
-import torch
-from ultralytics import YOLO
-
 from src import log as rlog
+
+# Tell ultralytics to skip all network operations before importing it.
+# Without this, ultralytics makes HTTP requests during import to check for
+# updates and download fonts — these hang on networks with SSL restrictions.
+os.environ.setdefault("YOLO_OFFLINE", "1")
+os.environ.setdefault("ULTRALYTICS_AUTOINSTALL", "0")
 
 # Resolve the repository root so the 'runs/' directory is always written
 # next to this repository, regardless of the working directory from which
@@ -83,10 +87,15 @@ def train(
 
     Returns the absolute path to the best checkpoint (best.pt).
     """
-    # Always use an absolute project path so YOLO does not accidentally write
-    # checkpoints inside the virtual environment directory (a known YOLO quirk
-    # when the current working directory is not the project root)
     abs_project = str((_REPO_ROOT / project).resolve())
+
+    # torch and ultralytics are imported lazily (inside this function) for two
+    # reasons: (1) they are large packages that take 30–60 s to load from disk
+    # on slow storage, and (2) ultralytics makes network calls on import that
+    # hang on restricted networks.  The spinner below shows feedback during load.
+    with rlog.console.status("[cyan]Loading torch + ultralytics…[/cyan]", spinner="dots"):
+        import torch
+        from ultralytics import YOLO
 
     # Detect available hardware and warn early if only CPU is available
     if torch.cuda.is_available():
@@ -137,6 +146,9 @@ def evaluate(data_yaml: str, weights: str, imgsz: int = DEFAULT_IMGSZ, split: st
         ("Weights", weights),
         ("Split",   split),
     ])
+
+    with rlog.console.status("[cyan]Loading torch + ultralytics…[/cyan]", spinner="dots"):
+        from ultralytics import YOLO
 
     model   = YOLO(weights)
     metrics = model.val(data=data_yaml, imgsz=imgsz, split=split)
