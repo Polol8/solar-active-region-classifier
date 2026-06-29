@@ -90,7 +90,7 @@ def run(args):
     best_weights = train(
         data_yaml=args.data_yaml, model_weights=args.weights,
         epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
-        name=args.run_name,
+        name=args.run_name, device=args.device, workers=args.workers,
     )
     tracker.done(4)
 
@@ -123,6 +123,10 @@ def _parse_args():
     p.add_argument("--epochs",   type=int, default=100)
     p.add_argument("--imgsz",    type=int, default=1024)
     p.add_argument("--batch",    type=int, default=8)
+    p.add_argument("--device",   default=None,
+                   help="Device: auto (default), dml (AMD GPU), cpu, 0 (first CUDA)")
+    p.add_argument("--workers",  type=int, default=4,
+                   help="DataLoader worker processes (default: 4)")
     p.add_argument("--run-name", default="solar_ar",
                    help="Name for the training run directory under runs/")
 
