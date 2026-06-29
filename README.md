@@ -32,8 +32,8 @@ Detector baseado em YOLOv11 que localiza e classifica regiões ativas (RAs) sola
 - Python 3.10+
 - A free [JSOC account](http://jsoc.stanford.edu/ajax/register_email.html) — email required for data export.
   Uma [conta JSOC](http://jsoc.stanford.edu/ajax/register_email.html) gratuita — e-mail necessário para exportação de dados.
-- GPU strongly recommended for training (CUDA 11.8+).
-  GPU recomendada para treinamento (CUDA 11.8+).
+- GPU recommended for training — NVIDIA (CUDA 11.8+) or AMD on Windows (DirectML, see below).
+  GPU recomendada para treinamento — NVIDIA (CUDA 11.8+) ou AMD no Windows (DirectML, veja abaixo).
 - [uv](https://docs.astral.sh/uv/) for dependency management.
   [uv](https://docs.astral.sh/uv/) para gerenciamento de dependências.
 
@@ -45,6 +45,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS/Linux
 # Create virtual environment and install all dependencies
 # Criar ambiente virtual e instalar todas as dependências
 uv sync
+
+# AMD GPU on Windows (DirectML backend — ROG Ally, RX series, iGPU)
+# GPU AMD no Windows (backend DirectML — ROG Ally, série RX, iGPU)
+uv sync --group amd
 
 # Install only development dependencies (no torch/sunpy — for CI or quick setup)
 # Instalar apenas dependências de desenvolvimento (sem torch/sunpy — para CI ou setup rápido)
@@ -64,11 +68,31 @@ uv run python main.py \
   --end   2014-06-30
 ```
 
+Large date ranges are automatically split into 90-day JSOC export chunks to avoid server timeouts.
+Intervalos longos são automaticamente divididos em blocos de 90 dias para evitar timeouts do servidor JSOC.
+
+### Resume from a specific stage / Retomar a partir de uma etapa
+
+If the download is already done, skip it with `--skip-download` (and likewise for other stages):
+Se o download já foi feito, pule-o com `--skip-download` (e analogamente para as demais etapas):
+
+```bash
+# Start from preprocessing (FITS already in data/raw/)
+# Começar pelo pré-processamento (FITS já em data/raw/)
+uv run python main.py --email your@email.com --start 2014-01-01 --end 2014-06-30 \
+  --skip-download
+
+# Start from training (dataset already split)
+# Começar pelo treinamento (dataset já dividido)
+uv run python main.py --email your@email.com --start 2014-01-01 --end 2014-06-30 \
+  --skip-download --skip-preprocess --skip-labels --skip-split
+```
+
 ### Step by step / Passo a passo
 
 ```bash
-# 1 — Download HMI magnetograms (6-hour cadence)
-#     Baixar magnetogramas HMI (cadência de 6 horas)
+# 1 — Download HMI magnetograms (6-hour cadence, auto-chunked)
+#     Baixar magnetogramas HMI (cadência de 6 horas, chunking automático)
 uv run python -m src.download --email your@email.com \
                               --start 2014-01-01 --end 2014-06-30 \
                               --cadence 6
@@ -95,6 +119,41 @@ uv run python -m src.train --eval --weights runs/solar_ar/weights/best.pt
 uv run python -m src.predict --weights runs/solar_ar/weights/best.pt \
                              --source data/images/ --output results/
 ```
+
+---
+
+## Hardware Guide / Guia de Hardware
+
+The training script auto-detects the best available device: CUDA → DirectML (AMD/Windows) → CPU.
+O script de treino detecta automaticamente o melhor dispositivo disponível: CUDA → DirectML (AMD/Windows) → CPU.
+
+| Hardware | Setup | Recommended flags / Flags recomendados |
+|---|---|---|
+| NVIDIA GPU (CUDA) | `uv sync` | `--batch 8 --imgsz 1024` |
+| AMD GPU / ROG Ally (DirectML) | `uv sync --group amd` | `--batch 2 --imgsz 512 --workers 4` |
+| CPU only / Apenas CPU | `uv sync` | `--weights yolo11n.pt --batch 4 --imgsz 512` |
+
+### AMD / ROG Ally
+
+```bash
+# Install DirectML backend (once) / Instalar backend DirectML (uma vez)
+uv sync --group amd
+
+# Train — device is auto-detected as "dml"
+# Treinar — dispositivo detectado automaticamente como "dml"
+uv run python -m src.train \
+  --weights yolo11n.pt \
+  --imgsz 512 --batch 2 --workers 4
+
+# Force a specific device manually / Forçar um dispositivo manualmente
+uv run python -m src.train --device cpu ...   # CPU
+uv run python -m src.train --device 0   ...   # first CUDA GPU
+uv run python -m src.train --device dml ...   # DirectML (AMD)
+```
+
+The ROG Ally's iGPU (Radeon 780M) shares LPDDR5 bandwidth with the CPU, so memory bandwidth is the bottleneck rather than compute. Reducing `--imgsz` from 1024 to 512 gives a ~4× speedup; switching from `yolo11m` to `yolo11n` gives a further ~8× reduction in parameter count.
+
+A iGPU do ROG Ally (Radeon 780M) compartilha a banda LPDDR5 com a CPU, então a limitação é a banda de memória, não o compute. Reduzir `--imgsz` de 1024 para 512 dá um ganho de ~4×; trocar de `yolo11m` para `yolo11n` reduz o número de parâmetros em ~8×.
 
 ---
 

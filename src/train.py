@@ -73,6 +73,25 @@ DEFAULT_IMGSZ  = 1024           # matches IMAGE_SIZE in preprocess.py
 DEFAULT_BATCH  = 8
 
 
+def _detect_device(device_override: str | None) -> tuple[str, str]:
+    """Return (device_str, label) for ultralytics.  Priority: CUDA → DirectML → CPU."""
+    import torch
+    if device_override:
+        return device_override, f"manual override  →  {device_override}"
+    if torch.cuda.is_available():
+        return "0", f"CUDA  ({torch.cuda.get_device_name(0)})"
+    try:
+        import torch_directml
+        idx = torch_directml.default_device()
+        return "dml", f"DirectML  ({torch_directml.device_name(idx)})"
+    except ImportError:
+        pass
+    # CPU fallback: saturate all Zen 4 cores for compute threads
+    n = os.cpu_count() or 4
+    torch.set_num_threads(n)
+    return "cpu", f"CPU  ({n} threads)  —  slow; consider uv sync --group amd"
+
+
 def train(
     data_yaml: str,
     model_weights: str = DEFAULT_MODEL,
@@ -82,6 +101,8 @@ def train(
     project: str = "runs",
     name: str = "solar_ar",
     resume: bool = False,
+    device: str | None = None,
+    workers: int = 4,
 ):
     """Fine-tune YOLOv11 on the solar active-region dataset.
 
@@ -97,18 +118,13 @@ def train(
         import torch
         from ultralytics import YOLO
 
-    # Detect available hardware and warn early if only CPU is available
-    if torch.cuda.is_available():
-        device_label = f"CUDA  ({torch.cuda.get_device_name(0)})"
-    else:
-        device_label = "CPU only  —  training will be slow; consider a GPU or reduce --imgsz/--epochs"
-        rlog.warn("No CUDA GPU detected. Running on CPU.")
+    device_str, device_label = _detect_device(device)
 
     rlog.kv_table([
         ("Model",    f"{model_weights}  (COCO pretrained)"),
         ("Device",   device_label),
         ("Dataset",  f"{data_yaml}  ·  4 classes"),
-        ("Config",   f"{epochs} epochs  ·  batch {batch}  ·  {imgsz} px"),
+        ("Config",   f"{epochs} epochs  ·  batch {batch}  ·  {imgsz} px  ·  {workers} workers"),
         ("Augment",  "fliplr=0  flipud=0  (polarity semantics preserved)"),
         ("Output",   f"{abs_project}/{name}/"),
     ])
@@ -122,6 +138,8 @@ def train(
         project    = abs_project,
         name       = name,
         resume     = resume,
+        device     = device_str,
+        workers    = workers,
         # --- Magnetogram-specific augmentation settings (see module docstring) ---
         fliplr     = 0.0,   # no horizontal flip — would invert polarity layout
         flipud     = 0.0,   # no vertical flip   — would invert Joy's Law tilt
@@ -179,6 +197,10 @@ def _parse_args():
     p.add_argument("--name",    default="solar_ar")
     p.add_argument("--resume",  action="store_true",
                    help="Resume training from the last checkpoint")
+    p.add_argument("--device",  default=None,
+                   help="Device: auto (default), dml (AMD GPU), cpu, 0 (first CUDA)")
+    p.add_argument("--workers", type=int, default=4,
+                   help="DataLoader worker processes (default: 4)")
     p.add_argument("--eval",    action="store_true",
                    help="Only evaluate (skip training); requires --weights pointing to a trained model")
     p.add_argument("--split",   default="test", choices=["train", "val", "test"])
@@ -199,4 +221,6 @@ if __name__ == "__main__":
             project       = args.project,
             name          = args.name,
             resume        = args.resume,
+            device        = args.device,
+            workers       = args.workers,
         )
