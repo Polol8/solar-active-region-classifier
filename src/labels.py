@@ -30,13 +30,21 @@ Background — MSH (Millionths of Solar Hemisphere)
   one solar hemisphere (≈ 3.04 × 10⁹ km²).  Typical ARs range from ~10 MSH
   (small sunspot) to ~2000 MSH (very large complex group).
 
-Bulk-query strategy (1 HEK query per day)
-  Making one HEK query per image (N queries) is fragile: each HTTP round-trip
-  takes 2–10 s and may hang indefinitely.  Instead we make ONE query per
-  calendar day, cache the day's events, and match them to individual image
-  timestamps by checking whether the event's lifetime overlaps a ±30-minute
-  window around the image observation time.  For a 1-month run this reduces
-  117 queries to 31.
+Bulk-query strategy (1 query per source per day)
+  We make ONE HEK query and ONE JSOC SHARP query per calendar day, cache
+  both in memory, and match records to individual image timestamps by
+  checking a ±30-minute window around the observation time.  For a 1-month
+  run this reduces hundreds of per-image requests to 31 × 2 = 62 total.
+
+Why JSOC SHARP for bounding boxes?
+  SHARP (Spaceweather HMI Active Region Patches, hmi.sharp_720s) are
+  pixel-precise cutouts of the HMI full-disk images, produced by the JSOC
+  from the same data we download.  The SHARP FITS header stores:
+    NAXIS1, NAXIS2  — cutout dimensions in native HMI pixels (= bbox size).
+    CRVAL1, CRVAL2  — HPC centre of the cutout in arcseconds.
+  This gives us exact bounding boxes without any area estimation.  We query
+  only metadata (jsoc_info.cgi, no authentication, no file download) and
+  match each HEK AR event to the closest SHARP patch by HPC distance.
 
 Implementation note — no sunpy.net dependency
   sunpy.net makes network calls during module import, blocking the terminal
@@ -58,6 +66,7 @@ import re
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -92,15 +101,51 @@ HEK_RESULT_LIMIT = 300
 HEK_RETURN = ",".join([
     "ar_mtwilsoncls",   # Mount Wilson class (primary classification field)
     "frm_specificid",   # fallback class field used by some pipeline versions
+    "ar_noaanum",       # NOAA AR number — used to match HEK events to SHARP records
     "hpc_x", "hpc_y",  # centroid position in arcseconds (HPC frame)
-    "ar_area",          # area in Millionths of Solar Hemisphere (MSH)
+    "ar_area",          # area in MSH (fallback sizing only)
     "event_starttime",  # start of the AR's tracked lifetime
     "event_endtime",    # end of the AR's tracked lifetime
 ])
 
-# Minimum normalised bounding-box side length.  Prevents degenerate 1-pixel
-# boxes for very small ARs where the area estimate rounds to near-zero.
-MIN_BOX_NORM         = 0.02
+# Minimum normalised bounding-box side length.
+MIN_BOX_NORM         = 0.015
+
+# IoU threshold for ground-truth NMS applied after all boxes are computed
+# for one image.  Overlapping boxes above this threshold are collapsed to the
+# largest one, preventing multiple identical labels for the same SHARP patch.
+NMS_IOU_THRESH       = 0.5
+
+# ---------------------------------------------------------------------------
+# JSOC / SHARP constants
+# ---------------------------------------------------------------------------
+
+# JSOC metadata endpoint.  jsoc_info.cgi is a public read-only REST API —
+# no email registration or authentication is required (unlike jsoc_fetch.cgi).
+JSOC_INFO_URL   = "http://jsoc.stanford.edu/cgi-bin/ajax/jsoc_info"
+
+# SHARP series and keywords we request.
+# CRVAL1/CRVAL2 in hmi.sharp_720s are always (0,0) — just the coordinate origin
+# definition, not the AR position.  NAXIS1/NAXIS2 are segment-level and not
+# queryable via rs_list.  Instead we use the heliographic bounding box
+# (LON_MIN/MAX, LAT_MIN/MAX) and match by NOAA AR number.
+SHARP_SERIES    = "hmi.sharp_720s"
+SHARP_KEYS      = "T_REC,HARPNUM,NOAA_ARS,LON_MIN,LON_MAX,LAT_MIN,LAT_MAX"
+
+# Per-day SHARP query: max records to accept.
+# ~20 active regions × 120 cadence steps/day = 2400; 5000 is safe headroom.
+SHARP_MAX_RECORDS = 5000
+
+# Timeout for JSOC jsoc_info requests.
+JSOC_TIMEOUT_SEC = 45
+
+# ---------------------------------------------------------------------------
+# Fallback constants (used when SHARP has no coverage for an AR)
+# ---------------------------------------------------------------------------
+
+# Fallback area (MSH) per Mount Wilson class — used only when SHARP metadata
+# is unavailable.  Physically motivated medians from Solar Cycle 24 statistics.
+_CLASS_DEFAULT_AREA_MSH = {0: 80, 1: 150, 2: 300, 3: 500}  # Alpha … BGD
 
 # HMI plate scale: the solar radius subtends ~960 arcseconds as seen from
 # Earth.  Used to convert physical AR area (MSH) → pixel area.
@@ -132,14 +177,34 @@ MTWILSON_MAP = {
 def _normalise_mtwilson(raw: str) -> int | None:
     """Return a class index for a raw Mount Wilson string, or None if unknown.
 
-    Strips whitespace, underscores and slashes (common HEK formatting artefacts)
-    before the dictionary lookup, so 'Beta-Gamma', 'betagamma', 'BG' all map
-    to index 2.
+    First tries an exact lookup after normalising whitespace/underscores/slashes.
+    Falls back to component-based parsing to handle HEK artefacts where the
+    NOAA SRS Zurich-type letter gets concatenated into the Mount Wilson field
+    (e.g. 'BETAA' = Beta + Zurich-type 'A', 'BETAAGAMMA' = Beta-Gamma,
+    'ALPHAGAMMA-DELTA' = Gamma-Delta complex).
+
+    Rule: take the most complex component present:
+      delta anywhere → 3 (BetaGammaDelta)
+      gamma anywhere → 2 (BetaGamma)
+      beta  anywhere → 1 (Beta)
+      alpha/anything → 0 (Alpha)
     """
     if not raw:
         return None
     key = re.sub(r"[\s_/]", "", raw.strip().lower())
-    return MTWILSON_MAP.get(key)
+    exact = MTWILSON_MAP.get(key)
+    if exact is not None:
+        return exact
+    # Fuzzy fallback: most complex component wins
+    if "delta" in key:
+        return 3
+    if "gamma" in key:
+        return 2
+    if "beta" in key:
+        return 1
+    if "alpha" in key:
+        return 0
+    return None
 
 
 def _hpc_to_pixel(hpc_x_arcsec: float, hpc_y_arcsec: float, meta: dict) -> tuple[float, float]:
@@ -187,8 +252,10 @@ def _estimate_box_size(area_msh: float, meta: dict) -> float:
     hemi_pix2  = np.pi * r_sun_pix ** 2
     # Convert MSH area to pixel² — floor prevents zero-area boxes
     area_pix2  = max(area_msh, 10.0) * 1e-6 * hemi_pix2
-    # Circular-equivalent diameter with 1.5× safety margin
-    box_native = 2 * np.sqrt(area_pix2 / np.pi) * 1.5
+    # Circular-equivalent diameter with 3× margin.  The HEK area reports the
+    # magnetic footprint; the full visible AR extent (penumbra + network) is
+    # typically 2–3× larger, and YOLO needs boxes that enclose the region.
+    box_native = 2 * np.sqrt(area_pix2 / np.pi) * 3.0
     # Scale to the resized PNG
     return float(box_native * meta["scale_x"])
 
@@ -293,88 +360,359 @@ def _events_for_image(day_events: list, date_obs: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# JSOC SHARP network helpers
+# ---------------------------------------------------------------------------
+
+def _parse_jsoc_time(raw: str) -> datetime | None:
+    """Parse a JSOC timestamp like '2014.01.01_17:58:00_TAI' to datetime."""
+    if not raw:
+        return None
+    parts = str(raw).split("_")  # ['2014.01.01', '17:58:00', 'TAI']
+    if len(parts) < 2:
+        return None
+    date_part = parts[0].replace(".", "-")  # '2014-01-01'
+    try:
+        return datetime.strptime(f"{date_part} {parts[1]}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _query_day_jsoc_sharp(day: str) -> list[dict]:
+    """Query JSOC jsoc_info.cgi for all SHARP patches on a given calendar day.
+
+    Args:
+        day: ISO date string 'YYYY-MM-DD'.
+
+    Returns:
+        A list of SHARP record dicts (possibly empty).  Never raises — errors
+        are caught and logged, returning [] so the pipeline falls back to the
+        area-based size estimate for that day.
+
+    Uses jsoc_info.cgi (public, no auth) rather than jsoc_fetch.cgi (requires
+    email registration).  Only metadata is fetched — no FITS files downloaded.
+    """
+    jsoc_day = day.replace("-", ".")      # '2014.01.01'
+    # [] before time range means "all HARPNUMs" in this bi-dimensional series
+    ds = f"{SHARP_SERIES}[][{jsoc_day}_00:00:00/1d@720s]"
+    params = urllib.parse.urlencode({
+        "op":  "rs_list",
+        "ds":  ds,
+        "key": SHARP_KEYS,
+        "max": str(SHARP_MAX_RECORDS),
+    })
+    url = f"{JSOC_INFO_URL}?{params}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=JSOC_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # jsoc_info returns column-major format: each keyword has its own
+        # "values" list; record i = {kw["name"]: kw["values"][i] for all kw}.
+        kws = data.get("keywords", [])
+        if not kws or not kws[0].get("values"):
+            return []
+        names  = [kw["name"]   for kw in kws]
+        cols   = [kw["values"] for kw in kws]
+        return [dict(zip(names, [col[i] for col in cols]))
+                for i in range(len(cols[0]))]
+    except Exception as exc:
+        rlog.warn(f"JSOC SHARP {day}: {type(exc).__name__} — skipping (will use fallback sizing)")
+        return []
+
+
+def _sharp_for_time(sharp_records: list[dict], date_obs: str) -> list[dict]:
+    """Filter SHARP records to those within ±HEK_WINDOW_MIN of the image time.
+
+    Unlike HEK events (which have a start/end lifetime), each SHARP record is
+    a snapshot at a specific T_REC.  We include it if |T_REC − date_obs| ≤ window.
+    """
+    try:
+        t = datetime.strptime(date_obs[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return sharp_records
+
+    window = timedelta(minutes=HEK_WINDOW_MIN)
+    matched = []
+    for rec in sharp_records:
+        t_rec = _parse_jsoc_time(rec.get("T_REC", ""))
+        if t_rec is None or abs(t_rec - t) <= window:
+            matched.append(rec)
+    return matched
+
+
+def _noaa_nums(raw: str) -> set[str]:
+    """Parse a NOAA AR number string (possibly comma-separated) to a set.
+
+    Normalises by stripping whitespace, 'AR' prefix, and leading zeros so that
+    '11944', 'AR11944', and '011944' all produce {'11944'}.
+    """
+    if not raw or str(raw).strip().upper() in ("", "MISSING", "NONE"):
+        return set()
+    nums: set[str] = set()
+    for part in str(raw).split(","):
+        n = part.strip().upper().lstrip("AR").lstrip("0")
+        if n.isdigit():
+            nums.add(n)
+    return nums
+
+
+def _sharp_box_arcsec(sharp_rec: dict) -> tuple[float, float] | None:
+    """Compute (width_arcsec, height_arcsec) from SHARP heliographic bounding box.
+
+    LON_MIN/LON_MAX and LAT_MIN/LAT_MAX are the Stonyhurst heliographic extent
+    of the SHARP patch in degrees.  Converting to arcseconds via the linear
+    approximation (valid within ~800 arcsec of disk centre):
+
+        arcsec_per_deg = π × R_sun_arcsec / 180
+        width  = ΔLon × cos(lat_centre) × arcsec_per_deg
+        height = ΔLat × arcsec_per_deg
+
+    Returns None if any value is missing or suspiciously zero (MISSING placeholder).
+    """
+    try:
+        lon_min = float(sharp_rec["LON_MIN"])
+        lon_max = float(sharp_rec["LON_MAX"])
+        lat_min = float(sharp_rec["LAT_MIN"])
+        lat_max = float(sharp_rec["LAT_MAX"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    # JSOC returns 0.0 as a placeholder for MISSING values
+    if lon_min == lon_max == 0.0 and lat_min == lat_max == 0.0:
+        return None
+
+    lat_c = (lat_min + lat_max) / 2.0
+    arcsec_per_deg = np.pi * SOLAR_RADIUS_ARCSEC / 180.0
+
+    w_arcsec = abs(lon_max - lon_min) * np.cos(np.radians(lat_c)) * arcsec_per_deg
+    h_arcsec = abs(lat_max - lat_min) * arcsec_per_deg
+    return float(w_arcsec), float(h_arcsec)
+
+
+def _match_sharp_by_noaa(noaa_num: str, sharp_records: list[dict]) -> dict | None:
+    """Return the SHARP record for the same NOAA AR, or None if not found.
+
+    Picks the record with the smallest |T_REC − image_time| among all records
+    that share the NOAA AR number.  The caller already filtered sharp_records to
+    ±HEK_WINDOW_MIN, so we just take the first one with a matching NOAA number.
+    """
+    target = _noaa_nums(noaa_num)
+    if not target:
+        return None
+    for rec in sharp_records:
+        if target & _noaa_nums(rec.get("NOAA_ARS", "")):
+            return rec
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Ground-truth NMS
+# ---------------------------------------------------------------------------
+
+def _nms(
+    boxes: list[tuple[int, float, float, float, float]],
+    iou_thresh: float = NMS_IOU_THRESH,
+) -> list[int]:
+    """Return the indices of boxes to keep after greedy non-maximum suppression.
+
+    Args:
+        boxes: list of (class_idx, cx, cy, w, h) — all normalised to [0, 1].
+        iou_thresh: boxes whose IoU with an already-kept box exceeds this are
+                    suppressed.  0.5 keeps distinct ARs that share a SHARP
+                    patch but removes near-identical duplicate labels.
+
+    Priority: larger area first (SHARP boxes are larger than fallback squares,
+    so they naturally win when the two overlap).
+    """
+    if len(boxes) <= 1:
+        return list(range(len(boxes)))
+
+    # Convert (cx, cy, w, h) → (x1, y1, x2, y2, area)
+    coords: list[tuple[float, float, float, float, float]] = []
+    for _, cx, cy, w, h in boxes:
+        coords.append((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, w * h))
+
+    # Process largest-first so SHARP-matched (bigger) boxes beat fallback (smaller)
+    order = sorted(range(len(boxes)), key=lambda i: -coords[i][4])
+
+    keep: list[int] = []
+    suppressed: set[int] = set()
+    for i in order:
+        if i in suppressed:
+            continue
+        keep.append(i)
+        x1i, y1i, x2i, y2i, ai = coords[i]
+        for j in order:
+            if j in suppressed or j <= i:
+                continue
+            x1j, y1j, x2j, y2j, aj = coords[j]
+            iw = max(0.0, min(x2i, x2j) - max(x1i, x1j))
+            ih = max(0.0, min(y2i, y2j) - max(y1i, y1j))
+            inter = iw * ih
+            union = ai + aj - inter
+            if union > 0 and inter / union > iou_thresh:
+                suppressed.add(j)
+
+    return sorted(keep)
+
+
+# ---------------------------------------------------------------------------
 # Label writing
 # ---------------------------------------------------------------------------
 
-def generate_label(sidecar_path: Path, label_dir: Path, events: list | None = None) -> int:
+def generate_label(
+    sidecar_path: Path,
+    label_dir: Path,
+    events: list | None = None,
+    sharp_records: list[dict] | None = None,
+) -> tuple[int, int, int]:
     """Write one YOLO .txt label file for the image described by sidecar_path.
 
     Args:
-        sidecar_path: Path to the WCS sidecar JSON written by preprocess.py.
-        label_dir:    Directory where the .txt label file will be written.
-        events:       Pre-fetched HEK event list.  Pass None only for
-                      standalone use — then a fresh day query is made.
+        sidecar_path:  Path to the WCS sidecar JSON written by preprocess.py.
+        label_dir:     Directory where the .txt label file will be written.
+        events:        Pre-fetched HEK event list (class + centroid).
+                       Pass None only for standalone use.
+        sharp_records: Pre-fetched JSOC SHARP records filtered to this image's
+                       time window.  Used for pixel-precise bounding boxes.
+                       Pass None to fall back to area-based estimation.
 
     Returns:
-        Number of bounding boxes written (0 = background image with no ARs).
+        (n_boxes, n_sharp, n_fallback) — total boxes written plus how many
+        used SHARP for sizing vs. the area-based fallback.
 
     YOLO format: each line is '<class_id> <cx> <cy> <w> <h>' with all four
     geometry values normalised to [0, 1] relative to image dimensions.
-    Boxes whose centre falls outside the image, or that would have
-    zero/negative clamped width/height, are silently discarded.
     """
     meta     = json.loads(sidecar_path.read_text())
     img_size = meta["target_size"]
 
     if events is None:
-        # Standalone fallback: query HEK for this specific day and filter
         day_evs = _query_day_hek(meta["date_obs"][:10])
         events  = _events_for_image(day_evs, meta["date_obs"])
 
     if not events:
-        # Write an empty file — YOLO treats this as a background (no-object) image
         (label_dir / f"{sidecar_path.stem}.txt").write_text("")
-        return 0
+        return 0, 0, 0
 
-    lines = []
+    # Sort events highest-complexity-first so that when two NOAA ARs share the
+    # same SHARP HARP patch the most complex class wins the slot.
+    def _ev_cls(ev: dict) -> int:
+        raw = ev.get("ar_mtwilsoncls") or ev.get("frm_specificid") or ""
+        c = _normalise_mtwilson(str(raw))
+        return c if c is not None else -1
+
+    events = sorted(events, key=_ev_cls, reverse=True)
+
+    # used_harps: once a SHARP patch (HARPNUM) has been assigned a label the
+    # patch is "spent" — subsequent NOAA ARs in the same patch are skipped so
+    # that the full-disk image never has two boxes that are identical in size
+    # and heavily overlap just because two sub-regions share one HARP.
+    used_harps: set[str] = set()
+
+    n_sharp    = 0
+    n_fallback = 0
+    candidates: list[tuple[int, float, float, float, float]] = []
+    # (cls_idx, cx_n, cy_n, w_n, h_n)
+
     for ev in events:
-        # ar_mtwilsoncls is the canonical Mount Wilson field.  frm_specificid
-        # is a fallback used by some NOAA SRS and older SHARP pipeline entries.
         raw_cls = ev.get("ar_mtwilsoncls") or ev.get("frm_specificid") or ""
         cls_idx = _normalise_mtwilson(str(raw_cls))
         if cls_idx is None:
-            # Event has no recognisable Mount Wilson class — skip it.
-            # This is common for events detected by non-magnetic pipelines
-            # (e.g. EUV-based detectors that report AR positions but no
-            # magnetic classification).
             continue
 
         try:
             hpc_x = float(ev["hpc_x"])
             hpc_y = float(ev["hpc_y"])
         except (KeyError, TypeError, ValueError):
-            continue  # missing or non-numeric position — skip
+            continue
 
-        try:
-            area_msh = float(ev.get("ar_area") or 0)
-        except (ValueError, TypeError):
-            area_msh = 0.0  # missing area → use the 10 MSH floor in _estimate_box_size
-
+        # --- Bounding box: SHARP (preferred) or area estimate (fallback) ----
         cx, cy = _hpc_to_pixel(hpc_x, hpc_y, meta)
-        box_px = _estimate_box_size(area_msh, meta)
 
-        # Normalise to [0, 1] relative to image side length
+        noaa_raw  = str(ev.get("ar_noaanum") or "")
+        sharp_rec = _match_sharp_by_noaa(noaa_raw, sharp_records or [])
+        box_arcsec = _sharp_box_arcsec(sharp_rec) if sharp_rec is not None else None
+
+        if box_arcsec is not None:
+            harp_id = str(sharp_rec.get("HARPNUM", ""))  # type: ignore[union-attr]
+            if harp_id and harp_id in used_harps:
+                # This HARP is already represented by a higher-complexity AR —
+                # skip to prevent duplicate same-patch labels.
+                continue
+            if harp_id:
+                used_harps.add(harp_id)
+            w_arcsec, h_arcsec = box_arcsec
+            w_px = w_arcsec / abs(meta["cdelt1"]) * meta["scale_x"]
+            h_px = h_arcsec / abs(meta["cdelt2"]) * meta["scale_y"]
+            n_sharp += 1
+        else:
+            # No SHARP match — skip rather than emit an unreliable area-estimate box.
+            continue
+        # ---------------------------------------------------------------------
+
         cx_n = cx / img_size
         cy_n = cy / img_size
-        w_n  = max(box_px / img_size, MIN_BOX_NORM)
-        h_n  = max(box_px / img_size, MIN_BOX_NORM)
+        w_n  = w_px / img_size
+        h_n  = h_px / img_size
 
-        # Discard events whose projected centre falls off-disk (behind the limb
-        # or at extremely high latitudes), which can happen near solar maximum
-        # when active regions emerge close to the east/west limb
         if not (0.0 <= cx_n <= 1.0 and 0.0 <= cy_n <= 1.0):
             continue
 
-        # Clamp the box so it does not extend beyond the image boundary.
-        # min(2*cx_n, 2*(1-cx_n)) is the maximum box width that keeps the
-        # centre-anchored box within [0, 1].
         w_n = min(w_n, min(2 * cx_n, 2 * (1 - cx_n)))
         h_n = min(h_n, min(2 * cy_n, 2 * (1 - cy_n)))
+        w_n = max(w_n, MIN_BOX_NORM)
+        h_n = max(h_n, MIN_BOX_NORM)
 
-        lines.append(f"{cls_idx} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}")
+        candidates.append((cls_idx, cx_n, cy_n, w_n, h_n))
+
+    # Final NMS pass — removes any remaining spatial overlaps between boxes
+    # from distinct HARPs that happen to be physically adjacent.
+    keep = _nms(candidates)
+    removed = len(candidates) - len(keep)
+    n_sharp    = max(0, n_sharp    - removed)
+    n_fallback = max(0, n_fallback - removed)
+
+    lines = [
+        f"{candidates[i][0]} {candidates[i][1]:.6f} {candidates[i][2]:.6f} "
+        f"{candidates[i][3]:.6f} {candidates[i][4]:.6f}"
+        for i in keep
+    ]
 
     (label_dir / f"{sidecar_path.stem}.txt").write_text("\n".join(lines))
-    return len(lines)
+    return len(lines), n_sharp, n_fallback
+
+
+# ---------------------------------------------------------------------------
+# Disk-cached day fetcher (used by generate_all_labels)
+# ---------------------------------------------------------------------------
+
+def _fetch_day(day: str, cache_dir: Path) -> tuple[str, list[dict], list[dict]]:
+    """Load HEK events and SHARP records for one day, with disk cache.
+
+    On first call for a given day the results are fetched over the network and
+    written to cache_dir/hek_YYYY-MM-DD.json and sharp_YYYY-MM-DD.json.
+    Subsequent calls (e.g. when re-running label generation after tweaking
+    logic) read the cached files instantly without any network traffic.
+
+    Returns (day, hek_events, sharp_records).  Both lists may be empty on
+    network failure; the label writer handles this with the area fallback.
+    """
+    hek_file   = cache_dir / f"hek_{day}.json"
+    sharp_file = cache_dir / f"sharp_{day}.json"
+
+    if hek_file.exists():
+        hek: list[dict] = json.loads(hek_file.read_text(encoding="utf-8"))
+    else:
+        hek = _query_day_hek(day)
+        hek_file.write_text(json.dumps(hek, ensure_ascii=False), encoding="utf-8")
+
+    if sharp_file.exists():
+        sharp: list[dict] = json.loads(sharp_file.read_text(encoding="utf-8"))
+    else:
+        sharp = _query_day_jsoc_sharp(day)
+        sharp_file.write_text(json.dumps(sharp, ensure_ascii=False), encoding="utf-8")
+
+    return day, hek, sharp
 
 
 # ---------------------------------------------------------------------------
@@ -386,56 +724,96 @@ def generate_all_labels(images_dir: str, labels_dir: str):
 
     Workflow:
       1. Read all sidecar JSONs and group them by calendar day (YYYY-MM-DD).
-      2. For each unique day, make one HEK REST request covering 00:00–23:59.
-      3. Cache the day's events in memory.
-      4. For each image in that day, filter cached events to ±HEK_WINDOW_MIN
-         around the image timestamp and write the YOLO label file.
-      5. After all images, print a class-distribution summary table.
+      2. Fetch HEK + SHARP for all days in parallel (up to 8 concurrent HTTP
+         requests).  Results are written to data/.cache/ so that re-runs skip
+         the network entirely.
+      3. For each image, filter cached events to ±HEK_WINDOW_MIN of the
+         observation time and write the YOLO label file.
+      4. Print a box-source and class-distribution summary.
     """
-    img_path = Path(images_dir)
-    lbl_path = Path(labels_dir)
+    img_path  = Path(images_dir)
+    lbl_path  = Path(labels_dir)
+    cache_dir = img_path.parent / ".cache"
     lbl_path.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     sidecars = sorted(img_path.glob("*.json"))
     if not sidecars:
         rlog.warn(f"No sidecar JSON files found in {img_path}")
         return
 
-    # Group sidecars by calendar day so that images from the same day share
-    # a single HEK query result (bulk-query strategy described in module doc)
     day_map: dict[str, list[tuple[Path, dict]]] = defaultdict(list)
     for sc in sidecars:
         meta = json.loads(sc.read_text())
         day_map[meta["date_obs"][:10]].append((sc, meta))
 
-    n_days = len(day_map)
+    days      = sorted(day_map.keys())
+    n_days    = len(days)
+    n_workers = min(n_days, 8)
+
+    # Count cached days for the info table
+    cached = sum(
+        1 for d in days
+        if (cache_dir / f"hek_{d}.json").exists()
+        and (cache_dir / f"sharp_{d}.json").exists()
+    )
+    cache_note = f"all cached" if cached == n_days else f"{cached}/{n_days} days cached"
+
     rlog.kv_table([
         ("Images",   f"{img_path}/  ({len(sidecars)} files, {n_days} days)"),
         ("Labels",   f"{lbl_path}/"),
-        ("Strategy", f"1 HEK query/day  ·  {HEK_TIMEOUT_SEC}s timeout  ·  ±{HEK_WINDOW_MIN} min match"),
+        ("Cache",    f"{cache_dir}/  ({cache_note})"),
+        ("Strategy", f"HEK + JSOC SHARP  ·  {n_workers} parallel fetches  ·  ±{HEK_WINDOW_MIN} min match"),
     ])
 
-    total_boxes = 0
-    timed_out   = 0
+    # --- Phase 1: fetch all days (parallel, disk-cached) ---
+    day_data: dict[str, tuple[list[dict], list[dict]]] = {}
+    hek_timeouts   = 0
+    sharp_timeouts = 0
 
-    with rlog.make_progress("Generating labels") as progress:
-        day_task = progress.add_task("[dim]HEK queries[/dim]", total=n_days)
-        img_task = progress.add_task("writing labels",         total=len(sidecars))
+    with rlog.make_progress("Fetching catalogue data") as progress:
+        fetch_task = progress.add_task("days", total=n_days)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_fetch_day, day, cache_dir): day for day in days}
+            for fut in as_completed(futures):
+                day, hek, sharp = fut.result()
+                day_data[day] = (hek, sharp)
+                if not hek:
+                    hek_timeouts += 1
+                if not sharp:
+                    sharp_timeouts += 1
+                progress.advance(fetch_task)
 
-        for day in sorted(day_map.keys()):
-            day_events = _query_day_hek(day)
-            if not day_events:
-                timed_out += 1
-            progress.advance(day_task)
+    # --- Phase 2: write label files (sequential — fast, pure CPU/disk) ---
+    total_boxes    = 0
+    total_sharp    = 0
+    total_fallback = 0
 
+    with rlog.make_progress("Writing labels") as progress:
+        img_task = progress.add_task("images", total=len(sidecars))
+        for day in days:
+            day_events, day_sharp = day_data[day]
             for sc, meta in day_map[day]:
-                img_events   = _events_for_image(day_events, meta["date_obs"])
-                total_boxes += generate_label(sc, lbl_path, events=img_events)
+                img_events = _events_for_image(day_events, meta["date_obs"])
+                img_sharp  = _sharp_for_time(day_sharp,   meta["date_obs"])
+                n, ns, nf  = generate_label(sc, lbl_path,
+                                            events=img_events,
+                                            sharp_records=img_sharp)
+                total_boxes    += n
+                total_sharp    += ns
+                total_fallback += nf
                 progress.advance(img_task)
 
     rlog.success(f"{total_boxes} boxes across {len(sidecars)} images")
-    if timed_out:
-        rlog.warn(f"{timed_out}/{n_days} days skipped (HEK timeout or empty)")
+    rlog.kv_table([
+        ("Box size source", ""),
+        ("  SHARP (precise)", f"{total_sharp} boxes ({100*total_sharp/max(total_boxes,1):.0f}%)"),
+        ("  area fallback",   f"{total_fallback} boxes ({100*total_fallback/max(total_boxes,1):.0f}%)"),
+    ])
+    if hek_timeouts:
+        rlog.warn(f"HEK: {hek_timeouts}/{n_days} days skipped")
+    if sharp_timeouts:
+        rlog.warn(f"JSOC SHARP: {sharp_timeouts}/{n_days} days with no data (fallback used)")
 
     # Tally boxes by class from the written label files to produce a
     # distribution table — useful for spotting severe class imbalance
@@ -452,13 +830,97 @@ def generate_all_labels(images_dir: str, labels_dir: str):
 # CLI
 # ---------------------------------------------------------------------------
 
+def diagnose(day: str, max_records: int = 3) -> None:
+    """Query both HEK and JSOC SHARP for *day* and print raw fields.
+
+    Shows whether SHARP records can be matched to HEK events by NOAA AR number
+    and whether the heliographic bounding box produces sensible arcsec sizes.
+
+    Usage:
+        python -m src.labels --diagnose 2014-01-07
+    """
+    import math
+
+    # --- HEK ---
+    hek_events = _query_day_hek(day)
+    rlog.console.print(f"\n[bold cyan]HEK — {len(hek_events)} AR events for {day}[/bold cyan]")
+    hek_fields = ["ar_mtwilsoncls", "frm_name", "ar_noaanum", "hpc_x", "hpc_y", "ar_area"]
+    for i, ev in enumerate(hek_events[:max_records]):
+        rlog.console.print(f"  [bold]Event {i + 1}[/bold]")
+        for f in hek_fields:
+            val = ev.get(f)
+            colour = "green" if val not in (None, "", "None") else "red"
+            rlog.console.print(f"    {f:20s} [{colour}]{val!r}[/{colour}]")
+    if len(hek_events) > max_records:
+        rlog.console.print(f"  … {len(hek_events) - max_records} more events omitted")
+
+    # --- JSOC SHARP ---
+    sharp_recs = _query_day_jsoc_sharp(day)
+    rlog.console.print(f"\n[bold cyan]JSOC SHARP — {len(sharp_recs)} records for {day}[/bold cyan]")
+    sharp_fields = ["T_REC", "HARPNUM", "NOAA_ARS", "LON_MIN", "LON_MAX", "LAT_MIN", "LAT_MAX"]
+    seen: set[str] = set()
+    shown = 0
+    for rec in sharp_recs:
+        harp = str(rec.get("HARPNUM", ""))
+        if harp in seen:
+            continue
+        seen.add(harp)
+        rlog.console.print(f"  [bold]HARP {harp}[/bold]")
+        for f in sharp_fields:
+            val = rec.get(f)
+            colour = "green" if val not in (None, "", "MISSING", "0.000000") else "red"
+            rlog.console.print(f"    {f:12s} [{colour}]{val!r}[/{colour}]")
+        # Also show computed box size in arcsec
+        box = _sharp_box_arcsec(rec)
+        if box:
+            w, h = box
+            rlog.console.print(f"    {'box':12s} [green]{w:.0f} x {h:.0f} arcsec[/green]")
+        else:
+            rlog.console.print(f"    {'box':12s} [red]could not compute[/red]")
+        shown += 1
+        if shown >= max_records:
+            break
+    if len(seen) < len({str(r.get("HARPNUM")) for r in sharp_recs}):
+        rlog.console.print(f"  … more HARPs omitted")
+
+    # --- Matching test ---
+    rlog.console.print(f"\n[bold cyan]Match test (first {max_records} HEK events with ar_noaanum)[/bold cyan]")
+    matched = shown_m = 0
+    for ev in hek_events:
+        noaa_raw = str(ev.get("ar_noaanum") or "")
+        if not noaa_raw or noaa_raw in ("", "None"):
+            continue
+        cls_raw = ev.get("ar_mtwilsoncls") or ev.get("frm_specificid") or ""
+        if _normalise_mtwilson(str(cls_raw)) is None:
+            continue
+        # Filter SHARP to ±HEK_WINDOW_MIN of noon on the day (approximate)
+        noon_dt = datetime.strptime(f"{day} 12:00:00", "%Y-%m-%d %H:%M:%S")
+        nearby = [r for r in sharp_recs
+                  if (t := _parse_jsoc_time(str(r.get("T_REC", "")))) is not None
+                  and abs((t - noon_dt).total_seconds()) <= HEK_WINDOW_MIN * 60 * 4]
+        rec = _match_sharp_by_noaa(noaa_raw, nearby or sharp_recs)
+        box = _sharp_box_arcsec(rec) if rec else None
+        status = "[green]SHARP match[/green]" if box else "[yellow]fallback[/yellow]"
+        rlog.console.print(f"  NOAA {noaa_raw:>6s}  {cls_raw:>20s}  {status}")
+        matched += (1 if box else 0)
+        shown_m += 1
+        if shown_m >= max_records:
+            break
+    rlog.console.print(f"  ({matched}/{shown_m} showed matched)")
+
+
 def _parse_args():
     p = argparse.ArgumentParser(description="Generate YOLO labels from HEK catalogue")
-    p.add_argument("--images", default="data/images")
-    p.add_argument("--labels", default="data/labels")
+    p.add_argument("--images",   default="data/images")
+    p.add_argument("--labels",   default="data/labels")
+    p.add_argument("--diagnose", metavar="YYYY-MM-DD",
+                   help="Print raw HEK + JSOC SHARP fields for one day and exit (no labels written)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    generate_all_labels(args.images, args.labels)
+    if args.diagnose:
+        diagnose(args.diagnose)
+    else:
+        generate_all_labels(args.images, args.labels)

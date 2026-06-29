@@ -15,6 +15,12 @@ data/images/
 data/labels/
 datasets/
 
+# JSOC/HEK response cache (regenerable, no need for version control)
+data/.cache/
+
+# Pre-trained YOLO weights (downloaded automatically by Ultralytics)
+*.pt
+
 # Model training outputs
 runs/
 
