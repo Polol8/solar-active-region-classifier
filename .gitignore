@@ -13,6 +13,7 @@ build/
 data/raw/
 data/images/
 data/labels/
+data/.cache/
 datasets/
 
 # Model training outputs
