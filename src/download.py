@@ -35,6 +35,11 @@ READ_TIMEOUT_SEC    = 120   # per-request read timeout
 MAX_RETRIES         = 3     # retries for transient network failures
 CHUNK_DAYS          = 90    # split large date ranges into ~3-month batches
 
+# Step 3 (file download) fans out to this many simultaneous connections.
+# Matches parfive's (sunpy's download manager) typical default of 5 — enough
+# to saturate a normal connection without hammering the JSOC file server.
+MAX_CONCURRENT_DOWNLOADS = 5
+
 
 def _date_chunks(start: str, end: str):
     """Yield (t_start_tai, days) pairs covering [start, end] in CHUNK_DAYS steps."""
@@ -58,6 +63,31 @@ def _full_range_query(start: str, end: str, cadence_hours: float) -> str:
     days = (e - s).days + 1
     t_start = s.strftime("%Y.%m.%d_00:00:00_TAI")
     return f"{HMI_SERIES}[{t_start}/{days}d@{int(cadence_hours * 60)}m]{{{HMI_SEGMENT}}}"
+
+
+async def _download_one(
+    session: aiohttp.ClientSession,
+    url: str,
+    output_path: Path,
+    semaphore: asyncio.Semaphore,
+    progress,
+    task,
+) -> str | None:
+    """Download a single file, bounded by semaphore. Returns the saved path, or None on failure."""
+    filename = output_path / url.split("/")[-1]
+    async with semaphore:
+        try:
+            async with session.get(url) as r:
+                r.raise_for_status()
+                with open(filename, "wb") as f:
+                    async for chunk in r.content.iter_chunked(1 << 20):
+                        f.write(chunk)
+            result = str(filename)
+        except Exception as exc:
+            rlog.warn(f"  Failed: {url.split('/')[-1]} — {exc}")
+            result = None
+    progress.advance(task)
+    return result
 
 
 async def _download_chunk(
@@ -141,25 +171,18 @@ async def _download_chunk(
         for r in records
         if r.get("url") or r.get("filename")
     ]
-    rlog.info(f"  [cyan]{len(urls)}[/cyan] files ready — downloading…")
+    rlog.info(f"  [cyan]{len(urls)}[/cyan] files ready — downloading "
+              f"({MAX_CONCURRENT_DOWNLOADS} at a time)…")
 
-    downloaded = []
     with rlog.make_progress("  Downloading") as progress:
-        task = progress.add_task("", total=len(urls))
-        for url in urls:
-            filename = output_path / url.split("/")[-1]
-            try:
-                async with session.get(url) as r:
-                    r.raise_for_status()
-                    with open(filename, "wb") as f:
-                        async for chunk in r.content.iter_chunked(1 << 20):
-                            f.write(chunk)
-                downloaded.append(str(filename))
-            except Exception as exc:
-                rlog.warn(f"  Failed: {url.split('/')[-1]} — {exc}")
-            progress.advance(task)
+        task      = progress.add_task("", total=len(urls))
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        results = await asyncio.gather(*(
+            _download_one(session, url, output_path, semaphore, progress, task)
+            for url in urls
+        ))
 
-    return downloaded
+    return [r for r in results if r is not None]
 
 
 async def _run_download(start: str, end: str, email: str,

@@ -16,6 +16,12 @@ data/labels/
 data/.cache/
 datasets/
 
+# Ad-hoc validation samples / visual QA overlays (not part of the tracked dataset)
+data/raw_sample/
+data/images_sample/
+data/labels_sample/
+debug/
+
 # Model training outputs
 runs/
 

@@ -73,8 +73,17 @@ DEFAULT_IMGSZ  = 1024           # matches IMAGE_SIZE in preprocess.py
 DEFAULT_BATCH  = 8
 
 
-def _detect_device(device_override: str | None) -> tuple[str, str]:
-    """Return (device_str, label) for ultralytics.  Priority: CUDA → DirectML → CPU."""
+def _detect_device(device_override: str | None):
+    """Return (device, label) for ultralytics.  Priority: CUDA → DirectML → CPU.
+
+    device is a plain string for the CUDA/CPU cases, but a real torch.device
+    object for DirectML.  ultralytics.utils.torch_utils.select_device() only
+    parses CUDA-style strings ('cpu', '0', '0,1') and raises ValueError on
+    anything else (e.g. the string 'dml') — but it returns any torch.device
+    instance unchanged, no parsing involved.  torch_directml.device() already
+    returns such an object, so it must be passed through as-is rather than
+    as a string.
+    """
     import torch
     if device_override:
         return device_override, f"manual override  →  {device_override}"
@@ -83,7 +92,7 @@ def _detect_device(device_override: str | None) -> tuple[str, str]:
     try:
         import torch_directml
         idx = torch_directml.default_device()
-        return "dml", f"DirectML  ({torch_directml.device_name(idx)})"
+        return torch_directml.device(idx), f"DirectML  ({torch_directml.device_name(idx)})"
     except ImportError:
         pass
     # CPU fallback: saturate all Zen 4 cores for compute threads
@@ -118,11 +127,20 @@ def train(
         import torch
         from ultralytics import YOLO
 
-    device_str, device_label = _detect_device(device)
+    device_arg, device_label = _detect_device(device)
+
+    # Ultralytics' AMP auto-check (ultralytics.utils.checks.check_amp) only
+    # special-cases device.type in {"cpu", "mps"} before falling through to a
+    # torch.cuda.get_device_name() call — it has no knowledge of DirectML's
+    # "privateuseone" device type, so it crashes with "Torch not compiled
+    # with CUDA enabled" on a DirectML (or any other non-CUDA) device.  Only
+    # a literal CUDA device index (e.g. "0") should enable AMP.
+    use_amp = isinstance(device_arg, str) and device_arg.isdigit()
 
     rlog.kv_table([
         ("Model",    f"{model_weights}  (COCO pretrained)"),
         ("Device",   device_label),
+        ("AMP",      "on" if use_amp else "off  (CUDA-only in this ultralytics version)"),
         ("Dataset",  f"{data_yaml}  ·  4 classes"),
         ("Config",   f"{epochs} epochs  ·  batch {batch}  ·  {imgsz} px  ·  {workers} workers"),
         ("Augment",  "fliplr=0  flipud=0  (polarity semantics preserved)"),
@@ -138,7 +156,8 @@ def train(
         project    = abs_project,
         name       = name,
         resume     = resume,
-        device     = device_str,
+        device     = device_arg,
+        amp        = use_amp,  # see comment above — AMP is CUDA-only here
         workers    = workers,
         # --- Magnetogram-specific augmentation settings (see module docstring) ---
         fliplr     = 0.0,   # no horizontal flip — would invert polarity layout

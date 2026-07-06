@@ -36,7 +36,9 @@ Bulk-query strategy (1 HEK query per day)
   calendar day, cache the day's events, and match them to individual image
   timestamps by checking whether the event's lifetime overlaps a ±30-minute
   window around the image observation time.  For a 1-month run this reduces
-  117 queries to 31.
+  117 queries to 31.  Those per-day queries are independent of each other, so
+  generate_all_labels fans them out across HEK_MAX_CONCURRENT_QUERIES worker
+  threads instead of making them one at a time.
 
 Implementation note — no sunpy.net dependency
   sunpy.net makes network calls during module import, blocking the terminal
@@ -58,6 +60,7 @@ import re
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -77,6 +80,13 @@ HEK_URL          = "https://www.lmsal.com/hek/her"
 # is skipped (images from that day get empty label files).
 HEK_TIMEOUT_SEC  = 45
 
+# generate_all_labels fans out day-queries to this many worker threads.
+# _query_day_hek uses blocking urllib (not asyncio), so a thread pool — not
+# an event loop — is what actually overlaps the network waits.  Kept modest
+# to stay polite to the HEK server (matches the same default used for JSOC
+# file downloads in src/download.py).
+HEK_MAX_CONCURRENT_QUERIES = 5
+
 # Half-width of the time window used to associate a cached day-query event
 # with a specific image.  An event is considered "active" at image time T
 # if its event_starttime ≤ T + window  AND  event_endtime ≥ T − window.
@@ -92,7 +102,26 @@ HEK_RESULT_LIMIT = 300
 HEK_RETURN = ",".join([
     "ar_mtwilsoncls",   # Mount Wilson class (primary classification field)
     "frm_specificid",   # fallback class field used by some pipeline versions
-    "hpc_x", "hpc_y",  # centroid position in arcseconds (HPC frame)
+    "frm_name",         # detection pipeline name — used to keep only the
+                         # authoritative source (see AUTHORITATIVE_FRM_SUBSTR)
+    "ar_noaanum",        # NOAA AR number — used to de-duplicate repeated
+                         # reports of the same physical region
+    "hpc_x", "hpc_y",  # centroid position in arcseconds (HPC frame).  Despite
+                         # NOAA's SRS report nominally applying at 00:00 UT,
+                         # this field empirically already tracks close to the
+                         # actual image time (verified against real magnetogram
+                         # features) — do NOT re-derive/rotate it from
+                         # event_starttime, that was tried and made positions
+                         # measurably worse (shifted off the real feature).
+    "hpc_bbox",         # WKT polygon bounding box in HPC arcsec.  Reliable as
+                         # a physical extent from the HMI SHARP and SPoCA
+                         # pipelines; the NOAA pipeline's own hpc_bbox spans
+                         # the region's full tracked lifetime, not its
+                         # instantaneous size (see SHARP_FRM_SUBSTR) —
+                         # fetched for every event regardless of source so
+                         # SHARP/SPoCA values can be cross-matched onto the
+                         # NOAA event (by ar_noaanum for SHARP, by position
+                         # for SPoCA — see SPOCA_FRM_SUBSTR)
     "ar_area",          # area in Millionths of Solar Hemisphere (MSH)
     "event_starttime",  # start of the AR's tracked lifetime
     "event_endtime",    # end of the AR's tracked lifetime
@@ -106,23 +135,66 @@ MIN_BOX_NORM         = 0.02
 # Earth.  Used to convert physical AR area (MSH) → pixel area.
 SOLAR_RADIUS_ARCSEC  = 960.0
 
+# HEK aggregates several independent detection pipelines under event_type=ar
+# (HMI SHARP patches, SPoCA, NOAA SWPC's SRS reports).  Only the NOAA SWPC
+# pipeline reliably populates ar_mtwilsoncls — the others report position/area
+# only.  A substring match (rather than an exact match) tolerates the label
+# having changed across HEK's history (e.g. "NOAA SWPC Observer").
+AUTHORITATIVE_FRM_SUBSTR = "noaa"
+
+# Substring identifying the HMI SHARP pipeline, whose hpc_bbox is the actual
+# magnetic-patch cutout extent (confirmed against live HEK data: aspect
+# ratios ~0.4-3.2, sizes of tens to hundreds of arcsec — physically
+# plausible).  This is DIFFERENT from the NOAA pipeline's own hpc_bbox,
+# which spans that region's full tracked lifetime and is dominated by
+# rotational drift (confirmed aspect ratios up to 47:1, i.e. not a size
+# measurement at all) — so box *size* is sourced from SHARP, cross-matched
+# by ar_noaanum, while box *classification* stays sourced from NOAA.
+SHARP_FRM_SUBSTR = "sharp"
+
+# SPoCA's hpc_bbox is also a reliable, physically plausible axis-aligned
+# extent (confirmed against live HEK data: aspect ratios ~0.4-1.4) — used
+# as a secondary size fallback for regions SHARP doesn't track (SHARP only
+# tracks patches above its own automatic detection threshold; confirmed
+# empirically that ~37% of authoritative NOAA events have no SHARP match).
+# Unlike SHARP, SPoCA carries no ar_noaanum, so it can't be joined by
+# number — matched to the NOAA event by spatial proximity instead (see
+# _nearest_spoca_bbox).
+SPOCA_FRM_SUBSTR = "spoca"
+
+# Maximum distance (arcsec) between a NOAA event's position and a SPoCA
+# detection for them to be considered the same region.  Real active
+# regions are rarely closer than this to each other, so a match within
+# this radius is very unlikely to be a coincidentally-nearby different
+# region.
+SPOCA_MATCH_RADIUS_ARCSEC = 150.0
+
+# Safety margin applied to SHARP's/SPoCA's measured hpc_bbox extent.
+# Smaller than _estimate_box_size's 1.5x margin because this is a measured
+# extent, not an estimate derived from area alone.
+HPC_BBOX_MARGIN = 1.1
+
 # YOLO class names in index order (must match configs/solar.yaml).
 CLASS_NAMES = ["Alpha", "Beta", "BetaGamma", "BetaGammaDelta"]
 
 # Mapping from raw HEK string → integer class index.  Multiple aliases exist
 # because different HEK pipelines (NOAA SRS, SHARP, SOON) use slightly
 # different capitalisation and separators.
+# Exact-match table.  Keys are pre-normalised (letters only, lowercase) since
+# _normalise_mtwilson strips everything else before the lookup — hyphenated
+# variants like "Beta-Gamma" collapse to "betagamma" and don't need a
+# separate entry here.
 MTWILSON_MAP = {
     # Alpha — single dominant polarity
     "alpha": 0, "a": 0,
     # Beta — clean bipolar pair
     "beta": 1,  "b": 1,
     # BetaGamma — bipolar with complex inversion line
-    "betagamma": 2, "beta-gamma": 2, "bg": 2,
+    "betagamma": 2, "bg": 2,
     # Gamma and BetaDelta are rare but share BetaGamma's complexity level
-    "gamma": 2,     "betadelta": 2,  "beta-delta": 2,
+    "gamma": 2,     "betadelta": 2,
     # BetaGammaDelta — highest complexity, delta umbrae present
-    "betagammadelta": 3, "beta-gamma-delta": 3, "bgd": 3,
+    "betagammadelta": 3, "bgd": 3,
 }
 
 # ---------------------------------------------------------------------------
@@ -132,14 +204,34 @@ MTWILSON_MAP = {
 def _normalise_mtwilson(raw: str) -> int | None:
     """Return a class index for a raw Mount Wilson string, or None if unknown.
 
-    Strips whitespace, underscores and slashes (common HEK formatting artefacts)
-    before the dictionary lookup, so 'Beta-Gamma', 'betagamma', 'BG' all map
-    to index 2.
+    Strips everything but letters (whitespace, underscores, slashes, hyphens
+    — common HEK formatting artefacts) before the dictionary lookup, so
+    'Beta-Gamma', 'betagamma', 'BG' all map to index 2.
+
+    If the exact-match lookup fails, falls back to a substring classification
+    (highest complexity tier first) to tolerate formatting artefacts seen in
+    real NOAA SRS data that a dictionary lookup can't anticipate — e.g. a
+    doubled letter like 'BETAAGAMMA-DELTA' — rather than silently dropping
+    the event.
     """
     if not raw:
         return None
-    key = re.sub(r"[\s_/]", "", raw.strip().lower())
-    return MTWILSON_MAP.get(key)
+    key = re.sub(r"[^a-z]", "", raw.strip().lower())
+    if not key:
+        return None
+
+    if key in MTWILSON_MAP:
+        return MTWILSON_MAP[key]
+
+    if "delta" in key:
+        return 3 if "gamma" in key else 2
+    if "gamma" in key:
+        return 2
+    if "beta" in key:
+        return 1
+    if "alpha" in key:
+        return 0
+    return None
 
 
 def _hpc_to_pixel(hpc_x_arcsec: float, hpc_y_arcsec: float, meta: dict) -> tuple[float, float]:
@@ -193,20 +285,129 @@ def _estimate_box_size(area_msh: float, meta: dict) -> float:
     return float(box_native * meta["scale_x"])
 
 
+def _filter_authoritative(events: list) -> list:
+    """Keep only events from the authoritative classification source, and
+    drop duplicate reports of the same numbered active region.
+
+    HEK aggregates several independent pipelines under event_type='ar'; only
+    frm_name containing "NOAA" reliably populates ar_mtwilsoncls (see
+    AUTHORITATIVE_FRM_SUBSTR).  Events sharing the same ar_noaanum within
+    that source are duplicate reports of the same region — keep the first.
+    """
+    seen_noaanum = set()
+    kept = []
+    for ev in events:
+        frm_name = str(ev.get("frm_name") or "")
+        if AUTHORITATIVE_FRM_SUBSTR not in frm_name.lower():
+            continue
+        noaanum = ev.get("ar_noaanum")
+        if noaanum:
+            if noaanum in seen_noaanum:
+                continue
+            seen_noaanum.add(noaanum)
+        kept.append(ev)
+    return kept
+
+
+def _sharp_lookup(events: list, image_time: datetime | None) -> dict:
+    """Map ar_noaanum -> the HMI SHARP event whose report time is closest to
+    image_time.
+
+    Unlike NOAA's once-daily report, HEK carries several SHARP observations
+    per day for the same region (confirmed against live HEK data: ~4-hour
+    spaced windows spanning the full day) — using whichever one HEK happens
+    to list first (as an earlier version of this code did) picks a
+    position/size up to ~24h stale relative to the image, which is exactly
+    the kind of error this function exists to avoid.  SHARP is used for
+    both position and size (see SHARP_FRM_SUBSTR); NOAA remains the only
+    source of Mount Wilson classification.
+    """
+    by_noaanum: dict = defaultdict(list)
+    for ev in events:
+        if SHARP_FRM_SUBSTR not in str(ev.get("frm_name") or "").lower():
+            continue
+        noaanum = ev.get("ar_noaanum")
+        if noaanum:
+            by_noaanum[noaanum].append(ev)
+
+    if image_time is None:
+        return {noaanum: evs[0] for noaanum, evs in by_noaanum.items()}
+
+    def _time_delta(ev):
+        t = _parse_hek_time(ev.get("event_starttime"))
+        return abs((image_time - t).total_seconds()) if t else float("inf")
+
+    return {noaanum: min(evs, key=_time_delta) for noaanum, evs in by_noaanum.items()}
+
+
+def _nearest_spoca_bbox(events: list, hpc_x: float, hpc_y: float) -> str | None:
+    """Return the hpc_bbox of the closest HMI SPoCA detection to (hpc_x,
+    hpc_y), within SPOCA_MATCH_RADIUS_ARCSEC, or None if none is close
+    enough (or no SPoCA events are present).
+
+    SPoCA carries no ar_noaanum (see SPOCA_FRM_SUBSTR), so it can't be
+    joined by number like SHARP — spatial proximity to the already-resolved
+    NOAA/SHARP position is used instead.
+    """
+    best_bbox = None
+    best_dist = SPOCA_MATCH_RADIUS_ARCSEC
+    for ev in events:
+        if SPOCA_FRM_SUBSTR not in str(ev.get("frm_name") or "").lower():
+            continue
+        try:
+            ex, ey = float(ev["hpc_x"]), float(ev["hpc_y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        dist = ((ex - hpc_x) ** 2 + (ey - hpc_y) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_bbox = ev.get("hpc_bbox")
+    return best_bbox
+
+
+_HPC_BBOX_RE = re.compile(r"POLYGON\s*\(\(([^)]+)\)\)", re.IGNORECASE)
+
+
+def _parse_hpc_bbox(bbox_wkt: str | None) -> tuple[float, float] | None:
+    """Parse a HEK hpc_bbox WKT polygon string into an axis-aligned
+    (width_arcsec, height_arcsec) bounding box, or None if unparseable.
+
+    HEK returns a closed ring of 'x y' vertex pairs, e.g.
+    'POLYGON((-885.39 -170.3982,-878.922 -169.6044,...,-885.39 -170.3982))'.
+    The polygon isn't guaranteed to be axis-aligned, so this takes the
+    envelope (min/max of the vertices) rather than an exact rotated
+    rectangle — sufficient for an axis-aligned YOLO box.
+    """
+    if not bbox_wkt:
+        return None
+    m = _HPC_BBOX_RE.search(bbox_wkt)
+    if not m:
+        return None
+    try:
+        pts = [tuple(map(float, p.split())) for p in m.group(1).split(",")]
+        xs, ys = zip(*pts)
+    except (ValueError, IndexError):
+        return None
+    return max(xs) - min(xs), max(ys) - min(ys)
+
+
 # ---------------------------------------------------------------------------
 # HEK network helpers — stdlib urllib only, no sunpy.net
 # ---------------------------------------------------------------------------
 
-def _query_day_hek(day: str) -> list:
+def _query_day_hek(day: str) -> list | None:
     """Query the HEK REST API for all AR events on a given calendar day.
 
     Args:
         day: ISO date string 'YYYY-MM-DD'.
 
     Returns:
-        A list of event dicts (possibly empty).  Never raises — network errors
-        are caught and logged as warnings, returning an empty list so the
-        pipeline continues with unlabelled images for that day.
+        A list of event dicts on success — possibly empty, meaning the query
+        succeeded and genuinely found no AR events that day.  Returns None if
+        the request itself failed (network error, timeout, malformed
+        response).  Callers MUST distinguish these two cases: None means
+        "unknown, don't write a label", not "confirmed background image".
+        Never raises — network errors are caught and logged as warnings.
 
     The request URL uses the standard HEK search parameters:
       cosec=2      → return JSON (not XML)
@@ -239,7 +440,7 @@ def _query_day_hek(day: str) -> list:
         return data.get("result", [])
     except Exception as exc:
         rlog.warn(f"HEK {day}: {type(exc).__name__} — skipping")
-        return []
+        return None
 
 
 def _parse_hek_time(raw: str) -> datetime | None:
@@ -296,7 +497,12 @@ def _events_for_image(day_events: list, date_obs: str) -> list:
 # Label writing
 # ---------------------------------------------------------------------------
 
-def generate_label(sidecar_path: Path, label_dir: Path, events: list | None = None) -> int:
+def generate_label(
+    sidecar_path: Path,
+    label_dir: Path,
+    events: list | None = None,
+    unmapped_counter: Counter | None = None,
+) -> int:
     """Write one YOLO .txt label file for the image described by sidecar_path.
 
     Args:
@@ -304,9 +510,16 @@ def generate_label(sidecar_path: Path, label_dir: Path, events: list | None = No
         label_dir:    Directory where the .txt label file will be written.
         events:       Pre-fetched HEK event list.  Pass None only for
                       standalone use — then a fresh day query is made.
+        unmapped_counter: Optional Counter to accumulate raw Mount Wilson
+                      strings that failed to normalise, for an aggregate
+                      end-of-run report (see generate_all_labels).
 
     Returns:
         Number of bounding boxes written (0 = background image with no ARs).
+        -1 if events is None and the standalone HEK query failed (network
+        error) — no label file is written in that case, so dataset.py's
+        existing skip-if-missing logic excludes the image instead of it
+        being mislabelled as a confirmed background observation.
 
     YOLO format: each line is '<class_id> <cx> <cy> <w> <h>' with all four
     geometry values normalised to [0, 1] relative to image dimensions.
@@ -319,7 +532,23 @@ def generate_label(sidecar_path: Path, label_dir: Path, events: list | None = No
     if events is None:
         # Standalone fallback: query HEK for this specific day and filter
         day_evs = _query_day_hek(meta["date_obs"][:10])
-        events  = _events_for_image(day_evs, meta["date_obs"])
+        if day_evs is None:
+            # Network/HEK failure — do not write a label file; the image
+            # should be treated as unlabelled, not a confirmed background.
+            return -1
+        events = _events_for_image(day_evs, meta["date_obs"])
+
+    # SHARP is a reliable source of both position and size (see
+    # SHARP_FRM_SUBSTR); NOAA's own hpc_bbox is not, and NOAA's once-daily
+    # report is coarser in time than SHARP's several-times-a-day cadence.
+    # Build the lookup from the full, unfiltered event list — keyed to
+    # whichever SHARP report is closest in time to this image — before
+    # narrowing down to the authoritative (NOAA) events used for
+    # classification.
+    image_time       = _parse_hek_time(meta.get("date_obs"))
+    sharp_by_noaanum = _sharp_lookup(events, image_time)
+    all_events       = events   # kept for the SPoCA fallback below (no ar_noaanum to join on)
+    events           = _filter_authoritative(events)
 
     if not events:
         # Write an empty file — YOLO treats this as a background (no-object) image
@@ -337,6 +566,8 @@ def generate_label(sidecar_path: Path, label_dir: Path, events: list | None = No
             # This is common for events detected by non-magnetic pipelines
             # (e.g. EUV-based detectors that report AR positions but no
             # magnetic classification).
+            if unmapped_counter is not None and raw_cls:
+                unmapped_counter[str(raw_cls)] += 1
             continue
 
         try:
@@ -345,19 +576,49 @@ def generate_label(sidecar_path: Path, label_dir: Path, events: list | None = No
         except (KeyError, TypeError, ValueError):
             continue  # missing or non-numeric position — skip
 
+        # Prefer the time-matched SHARP report's own position over NOAA's
+        # once-daily position when available — SHARP's automated centroid,
+        # refreshed every few hours, is closer to the image's exact
+        # observation time than NOAA's single daily report (see
+        # _sharp_lookup).  Falls back to NOAA's position when no SHARP
+        # report exists for this region (e.g. very small/new regions).
+        sharp_ev = sharp_by_noaanum.get(ev.get("ar_noaanum"))
+        if sharp_ev is not None:
+            try:
+                hpc_x = float(sharp_ev["hpc_x"])
+                hpc_y = float(sharp_ev["hpc_y"])
+            except (KeyError, TypeError, ValueError):
+                pass  # malformed SHARP position — keep NOAA's
+
         try:
             area_msh = float(ev.get("ar_area") or 0)
         except (ValueError, TypeError):
             area_msh = 0.0  # missing area → use the 10 MSH floor in _estimate_box_size
 
         cx, cy = _hpc_to_pixel(hpc_x, hpc_y, meta)
-        box_px = _estimate_box_size(area_msh, meta)
+
+        # Prefer SHARP's measured bounding box over the area-based estimate
+        # (ar_area is essentially never populated in practice) — see
+        # SHARP_FRM_SUBSTR for why NOAA's own hpc_bbox is not used here.
+        # SPoCA is a secondary fallback for the ~37% of regions SHARP
+        # doesn't track (see SPOCA_FRM_SUBSTR), matched by position since
+        # it carries no ar_noaanum to join on.
+        bbox_wkt = sharp_ev.get("hpc_bbox") if sharp_ev else None
+        if not bbox_wkt:
+            bbox_wkt = _nearest_spoca_bbox(all_events, hpc_x, hpc_y)
+        bbox_arcsec = _parse_hpc_bbox(bbox_wkt)
+        if bbox_arcsec is not None:
+            w_arcsec, h_arcsec = bbox_arcsec
+            box_w_px = w_arcsec / meta["cdelt1"] * meta["scale_x"] * HPC_BBOX_MARGIN
+            box_h_px = h_arcsec / meta["cdelt2"] * meta["scale_y"] * HPC_BBOX_MARGIN
+        else:
+            box_w_px = box_h_px = _estimate_box_size(area_msh, meta)
 
         # Normalise to [0, 1] relative to image side length
         cx_n = cx / img_size
         cy_n = cy / img_size
-        w_n  = max(box_px / img_size, MIN_BOX_NORM)
-        h_n  = max(box_px / img_size, MIN_BOX_NORM)
+        w_n  = max(box_w_px / img_size, MIN_BOX_NORM)
+        h_n  = max(box_h_px / img_size, MIN_BOX_NORM)
 
         # Discard events whose projected centre falls off-disk (behind the limb
         # or at extremely high latitudes), which can happen near solar maximum
@@ -412,30 +673,54 @@ def generate_all_labels(images_dir: str, labels_dir: str):
     rlog.kv_table([
         ("Images",   f"{img_path}/  ({len(sidecars)} files, {n_days} days)"),
         ("Labels",   f"{lbl_path}/"),
-        ("Strategy", f"1 HEK query/day  ·  {HEK_TIMEOUT_SEC}s timeout  ·  ±{HEK_WINDOW_MIN} min match"),
+        ("Strategy", f"{HEK_MAX_CONCURRENT_QUERIES} concurrent HEK queries  ·  "
+                     f"{HEK_TIMEOUT_SEC}s timeout  ·  ±{HEK_WINDOW_MIN} min match"),
     ])
 
     total_boxes = 0
-    timed_out   = 0
+    failed_days = []
+    unmapped: Counter = Counter()
+    days = sorted(day_map.keys())
 
     with rlog.make_progress("Generating labels") as progress:
         day_task = progress.add_task("[dim]HEK queries[/dim]", total=n_days)
         img_task = progress.add_task("writing labels",         total=len(sidecars))
 
-        for day in sorted(day_map.keys()):
-            day_events = _query_day_hek(day)
-            if not day_events:
-                timed_out += 1
-            progress.advance(day_task)
+        # Fan the day-queries out to a thread pool — _query_day_hek blocks on
+        # urllib, so threads (not asyncio) are what let these network waits
+        # overlap.  Fetch everything first, then write labels sequentially
+        # (fast — no network I/O left at that point).
+        day_events: dict[str, list | None] = {}
+        with ThreadPoolExecutor(max_workers=HEK_MAX_CONCURRENT_QUERIES) as executor:
+            futures = {executor.submit(_query_day_hek, day): day for day in days}
+            for future in as_completed(futures):
+                day_events[futures[future]] = future.result()
+                progress.advance(day_task)
+
+        for day in days:
+            events_for_day = day_events[day]
+
+            if events_for_day is None:
+                # Network/HEK failure — skip every image for this day rather
+                # than writing a false "confirmed background" empty label.
+                failed_days.append(day)
+                progress.advance(img_task, advance=len(day_map[day]))
+                continue
 
             for sc, meta in day_map[day]:
-                img_events   = _events_for_image(day_events, meta["date_obs"])
-                total_boxes += generate_label(sc, lbl_path, events=img_events)
+                img_events   = _events_for_image(events_for_day, meta["date_obs"])
+                total_boxes += generate_label(sc, lbl_path, events=img_events,
+                                               unmapped_counter=unmapped)
                 progress.advance(img_task)
 
     rlog.success(f"{total_boxes} boxes across {len(sidecars)} images")
-    if timed_out:
-        rlog.warn(f"{timed_out}/{n_days} days skipped (HEK timeout or empty)")
+    if failed_days:
+        n_skipped_imgs = sum(len(day_map[d]) for d in failed_days)
+        rlog.warn(f"{len(failed_days)}/{n_days} days failed (HEK network error) — "
+                  f"{n_skipped_imgs} images left unlabelled (excluded from dataset)")
+    if unmapped:
+        top = ", ".join(f"{cls!r} x{n}" for cls, n in unmapped.most_common(10))
+        rlog.warn(f"{sum(unmapped.values())} events skipped — unrecognised Mount Wilson class: {top}")
 
     # Tally boxes by class from the written label files to produce a
     # distribution table — useful for spotting severe class imbalance

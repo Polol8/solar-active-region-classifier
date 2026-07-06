@@ -27,11 +27,23 @@ Why does sunpy.map import lazily?
 
 Pipeline per FITS file:
   1. Load as a SunPy Map (reads FITS header + data, validates WCS).
-  2. Cast to float32 and replace NaN (off-disk pixels) with 0.
-  3. Clip to [−B_CLIP, +B_CLIP] Gauss.
-  4. Linearly rescale to uint8 [0, 255].
-  5. Resize to IMAGE_SIZE × IMAGE_SIZE pixels using Lanczos resampling.
-  6. Save the PNG and the companion WCS sidecar JSON.
+  2. If the header's CROTA2 indicates the camera was not solar-north-up
+     (common for raw hmi.M_720s exports, where CROTA2 ≈ 180°), rotate the
+     map so the array is north-up before anything else touches it.
+  3. Cast to float32 and replace NaN (off-disk pixels) with 0.
+  4. Clip to [−B_CLIP, +B_CLIP] Gauss.
+  5. Linearly rescale to uint8 [0, 255].
+  6. Resize to IMAGE_SIZE × IMAGE_SIZE pixels using Lanczos resampling.
+  7. Save the PNG and the companion WCS sidecar JSON.
+
+Why rotate before reading data/meta?
+  hmi.M_720s FITS files are delivered in the camera's raw orientation, not
+  solar-north-up: CROTA2 is ≈180° rather than ≈0°.  smap.rotate() reads
+  CROTA2 itself, rotates the pixel array, and recomputes CRPIX1/2 (and
+  zeroes CROTA2) on the returned map — so every downstream read of
+  smap.data / smap.meta must happen on the *rotated* map, otherwise the
+  linear WCS projection in labels.py (which assumes CROTA2=0) would be
+  applied to an image that is still upside-down/mirrored.
 
 Usage:
     python -m src.preprocess --input data/raw --output data/images
@@ -62,6 +74,11 @@ IMAGE_SIZE = 1024   # pixels
 # and uses the full contrast range for the active-region signal.
 B_CLIP = 1000.0     # Gauss
 
+# Tolerance (degrees) below which CROTA2 is treated as "already north-up" and
+# no rotation is performed.  Guards against wasting a resample step on the
+# sub-degree pointing jitter that's present even in properly oriented data.
+CROTA2_TOLERANCE_DEG = 1.0
+
 
 def fits_to_png(fits_path: Path, output_dir: Path, size: int = IMAGE_SIZE, b_clip: float = B_CLIP):
     """Convert a single HMI FITS file to a normalised PNG + WCS sidecar JSON.
@@ -84,7 +101,23 @@ def fits_to_png(fits_path: Path, output_dir: Path, size: int = IMAGE_SIZE, b_cli
     except Exception as exc:
         return None, str(exc)
 
+    # Correct camera orientation before anything else reads data/meta (see
+    # module docstring "Why rotate before reading data/meta?").
+    if abs(smap.meta.get("crota2", 0.0)) > CROTA2_TOLERANCE_DEG:
+        smap = smap.rotate(order=3)
+
     data = smap.data.astype(np.float32)
+
+    # FITS/WCS convention stores array row 0 as the physical BOTTOM of the
+    # map (south, for a CROTA2=0-normalised map — confirmed empirically
+    # against sunpy's own world_to_pixel: increasing row index = increasing
+    # HPC_Y/north).  Image.fromarray() instead treats row 0 as the TOP of
+    # the output image, so writing `smap.data` directly would produce a
+    # south-up (upside-down) PNG.  labels.py's _hpc_to_pixel already flips
+    # the Y axis to place north near row 0 assuming a north-up image — flip
+    # the pixel data here to match that assumption, or the two disagree by
+    # a full vertical mirror.
+    data = np.flipud(data)
 
     # Off-disk pixels (outside the solar limb) are stored as NaN in HMI files.
     # Replace them with 0 so they map to neutral grey after normalisation

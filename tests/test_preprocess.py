@@ -14,7 +14,7 @@ from PIL import Image
 from src.preprocess import fits_to_png, IMAGE_SIZE, B_CLIP
 
 
-def _make_mock_map(data: np.ndarray, date_obs="2014-01-01T00:00:00.000"):
+def _make_mock_map(data: np.ndarray, date_obs="2014-01-01T00:00:00.000", crota2=0.0):
     """Return a MagicMock that behaves like a sunpy.map.Map."""
     m = MagicMock()
     m.data = data
@@ -27,8 +27,10 @@ def _make_mock_map(data: np.ndarray, date_obs="2014-01-01T00:00:00.000"):
         "cdelt2": 0.504,
         "crval1": 0.0,
         "crval2": 0.0,
+        "crota2": crota2,
     }
     m.meta = meta
+    m.rotate.return_value = m   # rotate() returns a (mock) rotated map
     return m
 
 
@@ -137,6 +139,21 @@ class TestFitsToPng:
         img = np.array(Image.open(tmp_path / "test.png"))
         assert img.mean() < 55
 
+    def test_image_is_flipped_to_north_up(self, tmp_path):
+        # FITS/WCS convention: array row 0 = physical south (confirmed
+        # against sunpy's own world_to_pixel — see src/preprocess.py
+        # comment above the flip).  labels.py's _hpc_to_pixel assumes a
+        # north-up PNG (north near row 0) — the raw array must be flipped
+        # to match, or image content and label positions disagree by a
+        # full vertical mirror.
+        data = np.zeros((128, 128), dtype=np.float32)
+        data[0, :]  = B_CLIP    # raw row 0 (FITS south) — bright
+        data[-1, :] = -B_CLIP   # raw row -1 (FITS north) — dark
+        self._run(tmp_path, data)
+        img = np.array(Image.open(tmp_path / "test.png"))
+        assert img[0, :].mean() < 55     # PNG top = north = dark
+        assert img[-1, :].mean() > 200   # PNG bottom = south = bright
+
     def test_returns_none_on_bad_fits(self, tmp_path):
         bad_fits = tmp_path / "corrupt.fits"
         bad_fits.touch()
@@ -144,3 +161,32 @@ class TestFitsToPng:
             path, err = fits_to_png(bad_fits, tmp_path)
         assert path is None
         assert err is not None
+
+
+# ---------------------------------------------------------------------------
+# CROTA2 orientation correction
+# ---------------------------------------------------------------------------
+
+class TestOrientationCorrection:
+    def _run_with_crota2(self, tmp_path, crota2):
+        data = np.zeros((512, 512), dtype=np.float32)
+        fits_path = tmp_path / "test.fits"
+        fits_path.touch()
+        mock_map = _make_mock_map(data, crota2=crota2)
+        with patch("sunpy.map.Map", return_value=mock_map):
+            fits_to_png(fits_path, tmp_path)
+        return mock_map
+
+    def test_rotate_called_when_camera_not_north_up(self, tmp_path):
+        # hmi.M_720s is delivered with CROTA2 ~= 180 deg (raw camera orientation)
+        mock_map = self._run_with_crota2(tmp_path, crota2=180.013474)
+        mock_map.rotate.assert_called_once()
+
+    def test_rotate_not_called_when_already_north_up(self, tmp_path):
+        mock_map = self._run_with_crota2(tmp_path, crota2=0.0)
+        mock_map.rotate.assert_not_called()
+
+    def test_rotate_not_called_within_tolerance(self, tmp_path):
+        # Sub-degree pointing jitter should not trigger a resample
+        mock_map = self._run_with_crota2(tmp_path, crota2=0.05)
+        mock_map.rotate.assert_not_called()
