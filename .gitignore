@@ -22,6 +22,9 @@ data/images_sample/
 data/labels_sample/
 debug/
 
+# Pre-trained YOLO weights (downloaded automatically by Ultralytics)
+*.pt
+
 # Model training outputs
 runs/
 
